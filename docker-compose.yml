@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+  evm-balance-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: evm-balance-monitor
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # Required: Chain configurations
+      CHAINS_CONFIG: |
+        [
+          {
+            "name": "ethereum",
+            "rpc_url": "https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_ETH_API_KEY:-YOUR_ETH_API_KEY}",
+            "native_token_symbol": "ETH",
+            "decimals": 18
+          },
+          {
+            "name": "polygon",
+            "rpc_url": "https://polygon-mainnet.g.alchemy.com/v2/${ALCHEMY_POLYGON_API_KEY:-YOUR_POLYGON_API_KEY}",
+            "native_token_symbol": "MATIC",
+            "decimals": 18
+          }
+        ]
+      
+      # Required: Address configurations
+      ADDRESSES_CONFIG: |
+        [
+          {
+            "address": "${WALLET_1_ADDRESS:-0x742d35Cc6634C0532925a3b8D8A8E7E1aA9C0e5B}",
+            "label": "wallet_1",
+            "chains": ["ethereum", "polygon"]
+          },
+          {
+            "address": "${WALLET_2_ADDRESS:-0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045}",
+            "label": "wallet_2",
+            "chains": ["ethereum"]
+          }
+        ]
+      
+      # Optional: Configuration
+      PROMETHEUS_PORT: "${PROMETHEUS_PORT:-8000}"
+      UPDATE_INTERVAL: "${UPDATE_INTERVAL:-60}"
+    
+    # Use .env file if it exists
+    env_file:
+      - .env
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/metrics', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+        reservations:
+          memory: 128M
+          cpus: '0.25'
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  default:
+    name: evm-monitor-network
