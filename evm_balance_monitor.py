@@ -9,7 +9,7 @@ import time
 import logging
 import os
 from typing import Dict, List, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import requests
 from prometheus_client import start_http_server, Gauge, Counter
 import threading
@@ -17,9 +17,10 @@ import threading
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='[%(asctime)s] - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(os.getenv('LOGGER_NAME', 'evm_balance_monitor'))
+
 
 @dataclass
 class ChainConfig:
@@ -29,62 +30,78 @@ class ChainConfig:
     native_token_symbol: str
     decimals: int = 18
 
+
+@dataclass
+class TokenConfig:
+    """Configuration for an ERC-20 token on a specific chain"""
+    chain: str
+    symbol: str
+    contract_address: str
+    decimals: int = 18
+
+
 @dataclass
 class AddressConfig:
     """Configuration for an address to monitor"""
     address: str
     label: str
-    chains: List[str]  # List of chain names to monitor this address on
+    chains: List[str] = field(default_factory=list)  # Chain names to monitor native balance on
+    tokens: List[Dict[str, str]] = field(default_factory=list)  # [{"chain": ..., "symbol": ...}, ...]
+
 
 class EVMBalanceMonitor:
     """Monitor for EVM-compatible chain balances"""
-    
-    def __init__(self, chains: List[ChainConfig], addresses: List[AddressConfig]):
+
+    # Function selector for ERC-20 balanceOf(address), fixed across all standard tokens
+    BALANCE_OF_SELECTOR = '0x70a08231'
+
+    def __init__(self, chains: List[ChainConfig], addresses: List[AddressConfig], tokens: Optional[List[TokenConfig]] = None):
         self.chains = {chain.name: chain for chain in chains}  # Convert to dict for efficient lookup
         self.addresses = addresses
-        
-        # Validate that all referenced chains exist
-        self._validate_address_chains()
-        
+        self.tokens = {(token.chain, token.symbol): token for token in (tokens or [])}
+
+        # Validate that all referenced chains and tokens exist
+        self._validate_addresses()
+
         # Prometheus metrics
         self.balance_gauge = Gauge(
             'evm_balance_wei',
-            'Native token balance in wei',
+            'Token balance in wei (or smallest unit)',
             ['chain', 'address', 'label', 'token_symbol']
         )
-        
+
         self.balance_decimal_gauge = Gauge(
             'evm_balance_decimal',
-            'Native token balance in decimal form',
+            'Token balance in decimal form',
             ['chain', 'address', 'label', 'token_symbol']
         )
-        
+
         self.request_counter = Counter(
             'evm_balance_requests_total',
             'Total number of balance requests',
             ['chain', 'status']
         )
-        
+
         self.error_counter = Counter(
             'evm_balance_errors_total',
             'Total number of balance request errors',
             ['chain', 'error_type']
         )
-        
+
         self.last_update_timestamp = Gauge(
             'evm_balance_last_update_timestamp',
             'Timestamp of last successful balance update',
             ['chain', 'address', 'label']
         )
-        
+
         self.session = requests.Session()
         self.session.headers.update({
             'Content-Type': 'application/json',
             'User-Agent': 'EVMBalanceMonitor/1.0'
         })
-    
-    def _validate_address_chains(self):
-        """Validate that all chain references in addresses exist"""
+
+    def _validate_addresses(self):
+        """Validate that all chain and token references in addresses exist"""
         for address_config in self.addresses:
             for chain_name in address_config.chains:
                 if chain_name not in self.chains:
@@ -92,7 +109,20 @@ class EVMBalanceMonitor:
                         f"Address '{address_config.label}' references unknown chain '{chain_name}'. "
                         f"Available chains: {list(self.chains.keys())}"
                     )
-        
+            for token_ref in address_config.tokens:
+                chain_name = token_ref.get('chain')
+                symbol = token_ref.get('symbol')
+                if chain_name not in self.chains:
+                    raise ValueError(
+                        f"Address '{address_config.label}' references token on unknown chain '{chain_name}'. "
+                        f"Available chains: {list(self.chains.keys())}"
+                    )
+                if (chain_name, symbol) not in self.tokens:
+                    raise ValueError(
+                        f"Address '{address_config.label}' references unknown token '{symbol}' on chain '{chain_name}'. "
+                        f"Available tokens: {list(self.tokens.keys())}"
+                    )
+
     def hex_to_decimal(self, hex_value: str) -> int:
         """Convert hex string to decimal integer"""
         try:
@@ -103,20 +133,20 @@ class EVMBalanceMonitor:
         except ValueError as e:
             logger.error(f"Failed to convert hex to decimal: {hex_value}, error: {e}")
             return 0
-    
+
     def wei_to_decimal(self, wei_amount: int, decimals: int = 18) -> float:
         """Convert wei amount to decimal token amount"""
         return wei_amount / (10 ** decimals)
-    
-    def get_balance(self, chain: ChainConfig, address: str) -> Optional[int]:
-        """Get balance for an address on a specific chain"""
+
+    def _rpc_request(self, chain: ChainConfig, method: str, params: list, address: str) -> Optional[str]:
+        """Make a JSON-RPC request against a chain and return the raw hex result, or None on failure"""
         payload = {
             "jsonrpc": "2.0",
-            "method": "eth_getBalance",
-            "params": [address, "latest"],
+            "method": method,
+            "params": params,
             "id": 1
         }
-        
+
         try:
             response = self.session.post(
                 chain.rpc_url,
@@ -124,26 +154,23 @@ class EVMBalanceMonitor:
                 timeout=30
             )
             response.raise_for_status()
-            
+
             data = response.json()
-            
+
             if 'error' in data:
                 error_msg = data['error'].get('message', 'Unknown RPC error')
                 logger.error(f"RPC error for {chain.name} - {address}: {error_msg}")
                 self.error_counter.labels(chain=chain.name, error_type='rpc_error').inc()
                 return None
-            
+
             if 'result' not in data:
                 logger.error(f"No result in response for {chain.name} - {address}")
                 self.error_counter.labels(chain=chain.name, error_type='no_result').inc()
                 return None
-            
-            hex_balance = data['result']
-            balance_wei = self.hex_to_decimal(hex_balance)
-            
+
             self.request_counter.labels(chain=chain.name, status='success').inc()
-            return balance_wei
-            
+            return data['result']
+
         except requests.exceptions.RequestException as e:
             logger.error(f"Request failed for {chain.name} - {address}: {e}")
             self.error_counter.labels(chain=chain.name, error_type='request_failed').inc()
@@ -159,70 +186,134 @@ class EVMBalanceMonitor:
             self.error_counter.labels(chain=chain.name, error_type='unexpected').inc()
             self.request_counter.labels(chain=chain.name, status='failed').inc()
             return None
-    
+
+    def get_balance(self, chain: ChainConfig, address: str) -> Optional[int]:
+        """Get native currency balance for an address on a specific chain"""
+        result = self._rpc_request(chain, "eth_getBalance", [address, "latest"], address)
+        if result is None:
+            return None
+        return self.hex_to_decimal(result)
+
+    def get_token_balance(self, chain: ChainConfig, token: TokenConfig, address: str) -> Optional[int]:
+        """Get ERC-20 token balance for an address on a specific chain via eth_call"""
+        padded_address = address.lower().replace('0x', '').zfill(64)
+        call_data = self.BALANCE_OF_SELECTOR + padded_address
+        call_params = [{"to": token.contract_address, "data": call_data}, "latest"]
+
+        result = self._rpc_request(chain, "eth_call", call_params, address)
+        if result is None:
+            return None
+        return self.hex_to_decimal(result)
+
+    def _record_balance(self, chain_name: str, address: str, label: str,
+                        token_symbol: str,
+                        balance_wei: int, decimals: int):
+        """Update Prometheus metrics for a single balance reading"""
+        balance_decimal = self.wei_to_decimal(balance_wei, decimals)
+
+        self.balance_gauge.labels(
+            chain=chain_name,
+            address=address,
+            label=label,
+            token_symbol=token_symbol
+        ).set(balance_wei)
+
+        self.balance_decimal_gauge.labels(
+            chain=chain_name,
+            address=address,
+            label=label,
+            token_symbol=token_symbol
+        ).set(balance_decimal)
+
+        self.last_update_timestamp.labels(
+            chain=chain_name,
+            address=address,
+            label=label
+        ).set(time.time())
+
+        logger.info(
+            f"Updated balance for {label} ({address}) on {chain_name}: "
+            f"{balance_decimal:.6f} {token_symbol}"
+        )
+
     def update_metrics(self):
         """Update all balance metrics"""
         logger.info("Starting balance update cycle")
-        
-        # Create a mapping of chain -> addresses to minimize requests
+
+        # Create a mapping of chain -> addresses to monitor natively, to minimize requests
         chain_address_map = {}
         for address_config in self.addresses:
             for chain_name in address_config.chains:
-                if chain_name not in chain_address_map:
-                    chain_address_map[chain_name] = []
-                chain_address_map[chain_name].append(address_config)
-        
-        # Process each chain only once with its relevant addresses
+                chain_address_map.setdefault(chain_name, []).append(address_config)
+
+        # Create a mapping of chain -> (address, token) pairs to monitor
+        chain_token_map = {}
+        for address_config in self.addresses:
+            for token_ref in address_config.tokens:
+                chain_name = token_ref['chain']
+                token = self.tokens[(chain_name, token_ref['symbol'])]
+                chain_token_map.setdefault(chain_name, []).append((address_config, token))
+
+        # Process native balances, one chain at a time
         for chain_name, address_configs in chain_address_map.items():
             chain = self.chains[chain_name]
-            logger.info(f"Updating balances for chain: {chain_name} ({len(address_configs)} addresses)")
-            
+            logger.info(f"Updating native balances for chain: {chain_name} ({len(address_configs)} addresses)")
+
             for address_config in address_configs:
                 address = address_config.address
                 label = address_config.label
-                
+
                 balance_wei = self.get_balance(chain, address)
-                
+
                 if balance_wei is not None:
-                    balance_decimal = self.wei_to_decimal(balance_wei, chain.decimals)
-                    
-                    # Update Prometheus metrics
-                    self.balance_gauge.labels(
-                        chain=chain_name,
+                    self._record_balance(
+                        chain_name=chain_name,
                         address=address,
                         label=label,
-                        token_symbol=chain.native_token_symbol
-                    ).set(balance_wei)
-                    
-                    self.balance_decimal_gauge.labels(
-                        chain=chain_name,
-                        address=address,
-                        label=label,
-                        token_symbol=chain.native_token_symbol
-                    ).set(balance_decimal)
-                    
-                    self.last_update_timestamp.labels(
-                        chain=chain_name,
-                        address=address,
-                        label=label
-                    ).set(time.time())
-                    
-                    logger.info(
-                        f"Updated balance for {label} ({address}) on {chain_name}: "
-                        f"{balance_decimal:.6f} {chain.native_token_symbol}"
+                        token_symbol=chain.native_token_symbol,
+                        balance_wei=balance_wei,
+                        decimals=chain.decimals
                     )
                 else:
                     logger.warning(f"Failed to get balance for {label} ({address}) on {chain_name}")
-                
+
                 # Small delay between requests to avoid rate limiting
                 time.sleep(0.1)
-        
+
+        # Process token balances, one chain at a time
+        for chain_name, address_token_pairs in chain_token_map.items():
+            chain = self.chains[chain_name]
+            logger.info(f"Updating token balances for chain: {chain_name} ({len(address_token_pairs)} lookups)")
+
+            for address_config, token in address_token_pairs:
+                address = address_config.address
+                label = address_config.label
+
+                balance_wei = self.get_token_balance(chain, token, address)
+
+                if balance_wei is not None:
+                    self._record_balance(
+                        chain_name=chain_name,
+                        address=address,
+                        label=label,
+                        token_symbol=token.symbol,
+                        balance_wei=balance_wei,
+                        decimals=token.decimals
+                    )
+                else:
+                    logger.warning(
+                        f"Failed to get {token.symbol} balance for {label} ({address}) on {chain_name}"
+                    )
+
+                # Small delay between requests to avoid rate limiting
+                time.sleep(0.1)
+
         logger.info("Balance update cycle completed")
-    
+
     def start_monitoring(self, update_interval: int = 60):
         """Start the monitoring loop"""
         logger.info(f"Starting monitoring with {update_interval}s interval")
-        
+
         while True:
             try:
                 self.update_metrics()
@@ -234,16 +325,17 @@ class EVMBalanceMonitor:
                 logger.error(f"Error in monitoring loop: {e}")
                 time.sleep(10)  # Wait before retrying
 
+
 def load_chains_from_env() -> List[ChainConfig]:
     """Load chain configurations from environment variables"""
     chains = []
-    
+
     # Get chains configuration from environment
     chains_config = os.getenv('CHAINS_CONFIG')
     if not chains_config:
         logger.error("CHAINS_CONFIG environment variable is required")
         raise ValueError("CHAINS_CONFIG environment variable is required")
-    
+
     try:
         chains_data = json.loads(chains_config)
         for chain_data in chains_data:
@@ -261,19 +353,51 @@ def load_chains_from_env() -> List[ChainConfig]:
     except KeyError as e:
         logger.error(f"Missing required field in CHAINS_CONFIG: {e}")
         raise
-    
+
     return chains
+
+
+def load_tokens_from_env() -> List[TokenConfig]:
+    """Load ERC-20 token configurations from environment variables"""
+    tokens = []
+
+    # Get tokens configuration from environment (optional - not every deployment monitors tokens)
+    tokens_config = os.getenv('TOKENS_CONFIG')
+    if not tokens_config:
+        logger.info("TOKENS_CONFIG not set, skipping token monitoring")
+        return tokens
+
+    try:
+        tokens_data = json.loads(tokens_config)
+        for token_data in tokens_data:
+            token = TokenConfig(
+                chain=token_data['chain'],
+                symbol=token_data['symbol'],
+                contract_address=token_data['contract_address'],
+                decimals=token_data.get('decimals', 18)
+            )
+            tokens.append(token)
+            logger.info(f"Loaded token config: {token.symbol} on {token.chain} ({token.contract_address})")
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in TOKENS_CONFIG: {e}")
+        raise
+    except KeyError as e:
+        logger.error(f"Missing required field in TOKENS_CONFIG: {e}")
+        raise
+
+    return tokens
+
 
 def load_addresses_from_env() -> List[AddressConfig]:
     """Load address configurations from environment variables"""
     addresses = []
-    
+
     # Get addresses configuration from environment
     addresses_config = os.getenv('ADDRESSES_CONFIG')
     if not addresses_config:
         logger.error("ADDRESSES_CONFIG environment variable is required")
         raise ValueError("ADDRESSES_CONFIG environment variable is required")
-    
+
     try:
         addresses_data = json.loads(addresses_config)
         for address_data in addresses_data:
@@ -282,58 +406,80 @@ def load_addresses_from_env() -> List[AddressConfig]:
                 raise KeyError("'address' field is required")
             if 'label' not in address_data:
                 raise KeyError("'label' field is required")
-            if 'chains' not in address_data:
-                raise KeyError("'chains' field is required")
-            
+
+            chains = address_data.get('chains', [])
+            tokens = address_data.get('tokens', [])
+
             # Validate chains is a list
-            if not isinstance(address_data['chains'], list):
+            if not isinstance(chains, list):
                 raise ValueError(f"'chains' must be a list for address {address_data['address']}")
-            
+
+            # Validate tokens is a list of {"chain", "symbol"} entries
+            if not isinstance(tokens, list):
+                raise ValueError(f"'tokens' must be a list for address {address_data['address']}")
+            for token_ref in tokens:
+                if 'chain' not in token_ref or 'symbol' not in token_ref:
+                    raise ValueError(
+                        f"Each token entry for address {address_data['address']} requires 'chain' and 'symbol'"
+                    )
+
+            if not chains and not tokens:
+                raise ValueError(
+                    f"Address {address_data['address']} must specify at least one of 'chains' or 'tokens'"
+                )
+
             address = AddressConfig(
                 address=address_data['address'],
                 label=address_data['label'],
-                chains=address_data['chains']
+                chains=chains,
+                tokens=tokens
             )
             addresses.append(address)
-            logger.info(f"Loaded address config: {address.label} ({address.address}) for chains: {', '.join(address.chains)}")
+            logger.info(
+                f"Loaded address config: {address.label} ({address.address}) "
+                f"for chains: {', '.join(address.chains) or 'none'}, "
+                f"tokens: {', '.join(t['symbol'] + '@' + t['chain'] for t in address.tokens) or 'none'}"
+            )
     except json.JSONDecodeError as e:
         logger.error(f"Invalid JSON in ADDRESSES_CONFIG: {e}")
         raise
     except (KeyError, ValueError) as e:
         logger.error(f"Invalid address configuration: {e}")
         raise
-    
+
     return addresses
+
 
 def main():
     """Main function"""
     logger.info("Starting EVM Balance Monitor")
-    
+
     # Load configuration from environment variables
     try:
         chains = load_chains_from_env()
+        tokens = load_tokens_from_env()
         addresses = load_addresses_from_env()
     except (ValueError, json.JSONDecodeError, KeyError) as e:
         logger.error(f"Configuration error: {e}")
         logger.error("Please check your environment variables. See README for examples.")
         return
-    
+
     # Get optional configuration from environment
     prometheus_port = int(os.getenv('PROMETHEUS_PORT', '8000'))
     update_interval = int(os.getenv('UPDATE_INTERVAL', '60'))
-    
-    logger.info(f"Loaded {len(chains)} chains and {len(addresses)} addresses")
+
+    logger.info(f"Loaded {len(chains)} chains, {len(tokens)} tokens and {len(addresses)} addresses")
     logger.info(f"Prometheus port: {prometheus_port}")
     logger.info(f"Update interval: {update_interval}s")
-    
+
     # Initialize monitor
-    monitor = EVMBalanceMonitor(chains, addresses)
-    
+    monitor = EVMBalanceMonitor(chains, addresses, tokens)
+
     # Start Prometheus HTTP server
     start_http_server(prometheus_port)
     logger.info(f"Prometheus metrics server started on port {prometheus_port}")
     logger.info(f"Metrics available at http://localhost:{prometheus_port}/metrics")
-    
+
     # Start monitoring in a separate thread
     monitoring_thread = threading.Thread(
         target=monitor.start_monitoring,
@@ -341,13 +487,14 @@ def main():
     )
     monitoring_thread.daemon = True
     monitoring_thread.start()
-    
+
     try:
         # Keep main thread alive
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Shutting down...")
+
 
 if __name__ == "__main__":
     main()

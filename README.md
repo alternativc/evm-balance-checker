@@ -1,11 +1,12 @@
 # EVM Balance Monitor
 
-A Python script that monitors native token balances across EVM-compatible chains and exposes them via Prometheus metrics.
+A Python script that monitors native and ERC-20 token balances across EVM-compatible chains and exposes them via Prometheus metrics.
 
 ## Features
 
 - Monitor native token balances across multiple EVM chains
-- Convert hex balance responses to decimal format
+- Monitor ERC-20 token balances (e.g. USDC, USDT) via `balanceOf` calls
+- Convert hex balance responses to decimal format, using per-token decimals
 - Expose metrics via Prometheus
 - Configurable via environment variables
 - Support for multiple chains: Ethereum, Polygon, Arbitrum, Optimism, and more
@@ -39,23 +40,60 @@ JSON array of chain configurations:
 ```
 
 #### ADDRESSES_CONFIG
-JSON array of addresses to monitor with their target chains:
+JSON array of addresses to monitor, with the chains to check native balances on and/or the tokens to check:
 ```json
 [
   {
     "address": "0x742d35Cc6634C0532925a3b8D8A8E7E1aA9C0e5B",
     "label": "wallet_1",
-    "chains": ["ethereum", "polygon"]
+    "chains": ["ethereum", "polygon"],
+    "tokens": [
+      {"chain": "ethereum", "symbol": "USDC"}
+    ]
   }
 ]
 ```
 
-**Note**: Each address specifies which chains to monitor it on, avoiding unnecessary cross-chain scanning for efficiency.
+| Field | Required | Description |
+|-------|----------|-------------|
+| `address` | yes | Address to monitor |
+| `label` | yes | Human-readable name, used as a metric label |
+| `chains` | no* | Chain names to monitor the **native** balance on |
+| `tokens` | no* | List of `{"chain": ..., "symbol": ...}` entries referencing tokens defined in `TOKENS_CONFIG` |
+
+\* At least one of `chains` or `tokens` must be non-empty.
+
+**Note**: Each address specifies exactly which chains and tokens to monitor, avoiding unnecessary cross-chain scanning for efficiency. Monitoring a token on a chain does not require listing that chain in `chains` — only list it there if you also want the native balance.
+
+All chain and token references are validated at startup; an unknown chain or token causes the monitor to exit with a configuration error.
 
 ### Optional Environment Variables
 
+#### TOKENS_CONFIG
+JSON array of ERC-20 token definitions. If unset, token monitoring is skipped.
+```json
+[
+  {
+    "chain": "ethereum",
+    "symbol": "USDC",
+    "contract_address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    "decimals": 6
+  }
+]
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `chain` | yes | Chain name, must match a `name` in `CHAINS_CONFIG` |
+| `symbol` | yes | Token symbol; `(chain, symbol)` must be unique |
+| `contract_address` | yes | ERC-20 contract address on that chain |
+| `decimals` | no | Token decimals (default: 18). Set correctly — e.g. USDC/USDT use 6 |
+
+#### Other
+
 - `PROMETHEUS_PORT`: Port for Prometheus metrics server (default: 8000)
 - `UPDATE_INTERVAL`: Update interval in seconds (default: 60)
+- `LOGGER_NAME`: Name shown in each log line, e.g. to tell instances apart (default: `evm_balance_monitor`)
 
 ## Usage
 
@@ -63,7 +101,8 @@ JSON array of addresses to monitor with their target chains:
 
 ```bash
 export CHAINS_CONFIG='[{"name":"ethereum","rpc_url":"https://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY","native_token_symbol":"ETH","decimals":18}]'
-export ADDRESSES_CONFIG='[{"address":"0x742d35Cc6634C0532925a3b8D8A8E7E1aA9C0e5B","label":"wallet_1","chains":["ethereum"]}]'
+export TOKENS_CONFIG='[{"chain":"ethereum","symbol":"USDC","contract_address":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","decimals":6}]'
+export ADDRESSES_CONFIG='[{"address":"0x742d35Cc6634C0532925a3b8D8A8E7E1aA9C0e5B","label":"wallet_1","chains":["ethereum"],"tokens":[{"chain":"ethereum","symbol":"USDC"}]}]'
 python evm_balance_monitor.py
 ```
 
@@ -98,7 +137,8 @@ docker run -d \
   --name evm-balance-monitor \
   -p 8000:8000 \
   -e CHAINS_CONFIG='[{"name":"ethereum","rpc_url":"https://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY","native_token_symbol":"ETH","decimals":18}]' \
-  -e ADDRESSES_CONFIG='[{"address":"0x742d35Cc6634C0532925a3b8D8A8E7E1aA9C0e5B","label":"wallet_1","chains":["ethereum"]}]' \
+  -e TOKENS_CONFIG='[{"chain":"ethereum","symbol":"USDC","contract_address":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48","decimals":6}]' \
+  -e ADDRESSES_CONFIG='[{"address":"0x742d35Cc6634C0532925a3b8D8A8E7E1aA9C0e5B","label":"wallet_1","chains":["ethereum"],"tokens":[{"chain":"ethereum","symbol":"USDC"}]}]' \
   evm-balance-monitor
 ```
 
@@ -150,20 +190,27 @@ docker-compose up -d
 
 The script exposes the following Prometheus metrics on `http://localhost:8000/metrics`:
 
-- `evm_balance_wei`: Native token balance in wei
-- `evm_balance_decimal`: Native token balance in decimal form
-- `evm_balance_requests_total`: Total number of balance requests
-- `evm_balance_errors_total`: Total number of balance request errors
-- `evm_balance_last_update_timestamp`: Timestamp of last successful balance update
+| Metric | Labels | Description |
+|--------|--------|-------------|
+| `evm_balance_wei` | `chain`, `address`, `label`, `token_symbol` | Token balance in wei (or the token's smallest unit) |
+| `evm_balance_decimal` | `chain`, `address`, `label`, `token_symbol` | Token balance in decimal form |
+| `evm_balance_requests_total` | `chain`, `status` | Total number of balance requests |
+| `evm_balance_errors_total` | `chain`, `error_type` | Total number of balance request errors |
+| `evm_balance_last_update_timestamp` | `chain`, `address`, `label` | Timestamp of last successful balance update |
+
+Native balances are reported with the chain's `native_token_symbol`; ERC-20 balances carry the token's `symbol`. Contract addresses are not exported, so a token's `symbol` should not equal its chain's `native_token_symbol`, or the two series will collide.
 
 ### Example Prometheus Queries
 
 ```promql
-# Current ETH balance for a specific wallet
-evm_balance_decimal{chain="ethereum", label="wallet_1"}
+# Current native ETH balance for a specific wallet
+evm_balance_decimal{chain="ethereum", label="wallet_1", token_symbol="ETH"}
 
-# Total balance across all chains for a wallet
-sum(evm_balance_decimal) by (label)
+# Current USDC balance for a specific wallet
+evm_balance_decimal{chain="ethereum", label="wallet_1", token_symbol="USDC"}
+
+# Total balance per token across all chains for a wallet
+sum(evm_balance_decimal) by (label, token_symbol)
 
 # Balance change rate over time
 rate(evm_balance_decimal[5m])
@@ -211,6 +258,31 @@ The script works with any EVM-compatible chain. Common examples:
 ]
 ```
 
+### Multiple Tokens Example
+
+```json
+[
+  {
+    "chain": "ethereum",
+    "symbol": "USDC",
+    "contract_address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    "decimals": 6
+  },
+  {
+    "chain": "ethereum",
+    "symbol": "USDT",
+    "contract_address": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+    "decimals": 6
+  },
+  {
+    "chain": "polygon",
+    "symbol": "USDC",
+    "contract_address": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+    "decimals": 6
+  }
+]
+```
+
 ### Multiple Addresses Example
 
 ```json
@@ -218,7 +290,19 @@ The script works with any EVM-compatible chain. Common examples:
   {
     "address": "0x742d35Cc6634C0532925a3b8D8A8E7E1aA9C0e5B",
     "label": "hot_wallet",
-    "chains": ["ethereum", "polygon", "arbitrum"]
+    "chains": ["ethereum", "polygon", "arbitrum"],
+    "tokens": [
+      {"chain": "ethereum", "symbol": "USDC"},
+      {"chain": "ethereum", "symbol": "USDT"},
+      {"chain": "polygon", "symbol": "USDC"}
+    ]
+  },
+  {
+    "address": "0x1f9090aaE28b8a3dCeaDf281B0F12828e676c326",
+    "label": "stablecoin_vault",
+    "tokens": [
+      {"chain": "ethereum", "symbol": "USDC"}
+    ]
   },
   {
     "address": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
@@ -262,6 +346,7 @@ services:
     restart: unless-stopped
     environment:
       - CHAINS_CONFIG=${CHAINS_CONFIG}
+      - TOKENS_CONFIG=${TOKENS_CONFIG}
       - ADDRESSES_CONFIG=${ADDRESSES_CONFIG}
     deploy:
       resources:
@@ -286,7 +371,7 @@ networks:
 ```
 
 ### Chain-Specific Address Monitoring
-- Each address configuration specifies which chains to monitor
+- Each address configuration specifies which chains (native) and tokens (ERC-20) to monitor
 - Eliminates unnecessary cross-chain scanning
 - Reduces API calls and improves performance
 - Allows different addresses to be monitored on different chains
@@ -303,6 +388,7 @@ The script includes robust error handling for:
 - JSON parsing errors
 - Invalid hex values
 - Missing configuration
+- References to unknown chains or tokens in `ADDRESSES_CONFIG`
 
 All errors are logged and tracked in Prometheus metrics for monitoring.
 
