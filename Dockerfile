@@ -20,6 +20,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # Copy application code
 COPY evm_balance_monitor.py .
+COPY exchanges/ ./exchanges/
 
 # Change ownership to non-root user
 RUN chown -R appuser:appuser /app
