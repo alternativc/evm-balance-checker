@@ -20,6 +20,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # Copy application code
 COPY evm_balance_monitor.py .
+COPY exchanges/ ./exchanges/
 
 # Change ownership to non-root user
 RUN chown -R appuser:appuser /app
@@ -31,7 +32,7 @@ USER appuser
 EXPOSE 8000
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+HEALTHCHECK --interval=120s --timeout=30s --start-period=60s --retries=3 \
     CMD python -c "import requests; requests.get('http://localhost:8000/metrics', timeout=5)" || exit 1
 
 # Default command
